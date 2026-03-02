@@ -1,309 +1,479 @@
-import { useState, useEffect } from 'react';
-import { Plus, Trash2, Save, Printer, RefreshCw, Search } from 'lucide-react';
-import { Product, InvoiceItem } from '../lib/utils';
-import jsPDF from 'jspdf';
+import { useState, useEffect, useRef } from 'react';
+import { Plus, Trash2, Printer, Save, User, Barcode, CreditCard, Banknote } from 'lucide-react';
+import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import { useNavigate } from 'react-router-dom';
-import { toast } from 'sonner';
 import { useLanguage } from '../contexts/LanguageContext';
+import { toast } from 'sonner';
+import { Product, Customer, InvoiceItem } from '../lib/utils';
+import { useReactToPrint } from 'react-to-print';
 
 export default function InvoiceCreator() {
-  const navigate = useNavigate();
-  const { t, language } = useLanguage();
-  const [products, setProducts] = useState<Product[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-
-  // Invoice State
+  const { t, dir } = useLanguage();
+  const [items, setItems] = useState<InvoiceItem[]>([]);
   const [customerName, setCustomerName] = useState('');
+  const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
   const [invoiceDate, setInvoiceDate] = useState(new Date().toISOString().split('T')[0]);
   const [taxRate, setTaxRate] = useState(14);
-  const [items, setItems] = useState<InvoiceItem[]>([
-    { product_name: '', quantity: 1, unit_price: 0, subtotal: 0 }
-  ]);
+  const [isSaving, setIsSaving] = useState(false);
+  
+  // Data
+  const [products, setProducts] = useState<Product[]>([]);
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  
+  // UI States
+  const [barcodeInput, setBarcodeInput] = useState('');
+  const [showPaymentModal, setShowPaymentModal] = useState(false);
+  const [paymentMethod, setPaymentMethod] = useState<'cash' | 'visa' | 'credit'>('cash');
+  const [amountPaid, setAmountPaid] = useState(0);
 
-  // Fetch products for autocomplete
+  // Print Ref
+  const printRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
-    fetch('/api/products')
-      .then(res => res.json())
-      .then(data => setProducts(data))
-      .catch(err => console.error('Failed to load products', err));
+    fetchProducts();
+    fetchCustomers();
   }, []);
 
-  // Calculations
-  const subtotal = items.reduce((sum, item) => sum + (item.subtotal || 0), 0);
-  const taxAmount = (subtotal * taxRate) / 100;
-  const totalAmount = subtotal + taxAmount;
-
-  const handleItemChange = (index: number, field: keyof InvoiceItem, value: any) => {
-    const newItems = [...items];
-    const item = { ...newItems[index], [field]: value };
-
-    // Auto-calculate subtotal
-    if (field === 'quantity' || field === 'unit_price') {
-      item.subtotal = Number(item.quantity) * Number(item.unit_price);
+  const fetchProducts = async () => {
+    try {
+      const res = await fetch('/api/products');
+      const data = await res.json();
+      setProducts(data);
+    } catch (error) {
+      console.error('Failed to load products');
     }
+  };
 
-    // If product name changes, try to find price
-    if (field === 'product_name') {
-      const product = products.find(p => p.name === value);
-      if (product) {
-        item.unit_price = product.price;
-        item.subtotal = Number(item.quantity) * product.price;
-      }
+  const fetchCustomers = async () => {
+    try {
+      const res = await fetch('/api/customers');
+      const data = await res.json();
+      setCustomers(data);
+    } catch (error) {
+      console.error('Failed to load customers');
     }
-
-    newItems[index] = item;
-    setItems(newItems);
   };
 
   const addItem = () => {
     setItems([...items, { product_name: '', quantity: 1, unit_price: 0, subtotal: 0 }]);
   };
 
+  const updateItem = (index: number, field: keyof InvoiceItem, value: any) => {
+    const newItems = [...items];
+    const item = { ...newItems[index], [field]: value };
+    
+    // Auto-fill price if product selected
+    if (field === 'product_name') {
+      const product = products.find(p => p.name === value);
+      if (product) {
+        item.unit_price = product.price;
+        item.product_id = product.id;
+      }
+    }
+
+    item.subtotal = item.quantity * item.unit_price;
+    newItems[index] = item;
+    setItems(newItems);
+  };
+
   const removeItem = (index: number) => {
-    if (items.length > 1) {
-      setItems(items.filter((_, i) => i !== index));
+    setItems(items.filter((_, i) => i !== index));
+  };
+
+  const handleBarcodeScan = (e: React.FormEvent) => {
+    e.preventDefault();
+    const product = products.find(p => p.barcode === barcodeInput);
+    if (product) {
+      const existingItemIndex = items.findIndex(i => i.product_id === product.id);
+      if (existingItemIndex >= 0) {
+        const newItems = [...items];
+        newItems[existingItemIndex].quantity += 1;
+        newItems[existingItemIndex].subtotal = newItems[existingItemIndex].quantity * newItems[existingItemIndex].unit_price;
+        setItems(newItems);
+        toast.success(`Increased quantity for ${product.name}`);
+      } else {
+        setItems([...items, { 
+          product_id: product.id, 
+          product_name: product.name, 
+          quantity: 1, 
+          unit_price: product.price, 
+          subtotal: product.price 
+        }]);
+        toast.success(`Added ${product.name}`);
+      }
+      setBarcodeInput('');
+    } else {
+      toast.error('Product not found');
     }
   };
 
-  const handleSave = async () => {
-    if (!customerName) {
+  const calculateTotals = () => {
+    const subtotal = items.reduce((sum, item) => sum + item.subtotal, 0);
+    const taxAmount = subtotal * (taxRate / 100);
+    const total = subtotal + taxAmount;
+    return { subtotal, taxAmount, total };
+  };
+
+  const { subtotal, taxAmount, total } = calculateTotals();
+
+  const handleSaveInvoice = async () => {
+    if (!customerName && !selectedCustomer) {
       toast.error(t('enterName'));
       return;
     }
 
-    setSaving(true);
+    setIsSaving(true);
     try {
-      const payload = {
-        customer_name: customerName,
-        invoice_date: invoiceDate,
-        subtotal,
-        tax_rate: taxRate,
-        tax_amount: taxAmount,
-        total_amount: totalAmount,
-        status: 'delivered',
-        items
-      };
-
       const res = await fetch('/api/invoices', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({
+          customer_id: selectedCustomer?.id,
+          customer_name: selectedCustomer ? selectedCustomer.name : customerName,
+          invoice_date: invoiceDate,
+          subtotal,
+          tax_rate: taxRate,
+          tax_amount: taxAmount,
+          total_amount: total,
+          status: 'delivered',
+          payment_method: paymentMethod,
+          amount_paid: amountPaid,
+          change_due: amountPaid - total,
+          items
+        }),
       });
 
       if (res.ok) {
-        const data = await res.json();
         toast.success(t('invoiceSaved'));
-        // Reset form or redirect
+        // Reset form
+        setItems([]);
         setCustomerName('');
-        setItems([{ product_name: '', quantity: 1, unit_price: 0, subtotal: 0 }]);
-        navigate('/invoices');
+        setSelectedCustomer(null);
+        setShowPaymentModal(false);
       } else {
         toast.error(t('failedSaveInvoice'));
       }
     } catch (error) {
-      console.error(error);
       toast.error(t('errorSaving'));
     } finally {
-      setSaving(false);
+      setIsSaving(false);
     }
   };
 
-  const handlePrint = () => {
-    const doc = new jsPDF();
-    
-    // Header
-    doc.setFontSize(22);
-    doc.setTextColor(225, 29, 72); // Rose 600
-    doc.text('Soft Rose', 14, 20);
-    
-    doc.setFontSize(12);
-    doc.setTextColor(100);
-    doc.text('Sales Invoice', 14, 28);
-
-    // Info
-    doc.setFontSize(10);
-    doc.text(`Customer: ${customerName}`, 14, 40);
-    doc.text(`Date: ${invoiceDate}`, 14, 46);
-    doc.text(`Invoice #: NEW`, 160, 40);
-
-    // Table
-    autoTable(doc, {
-      startY: 55,
-      head: [['Item', 'Qty', 'Price', 'Total']],
-      body: items.map(item => [
-        item.product_name,
-        item.quantity,
-        item.unit_price.toFixed(2),
-        item.subtotal.toFixed(2)
-      ]),
-      theme: 'grid',
-      headStyles: { fillColor: [225, 29, 72] }
-    });
-
-    // Totals
-    const finalY = (doc as any).lastAutoTable.finalY + 10;
-    doc.text(`Subtotal: ${subtotal.toFixed(2)}`, 140, finalY);
-    doc.text(`Tax (${taxRate}%): ${taxAmount.toFixed(2)}`, 140, finalY + 6);
-    doc.setFontSize(12);
-    doc.setTextColor(225, 29, 72);
-    doc.text(`Total: ${totalAmount.toFixed(2)}`, 140, finalY + 14);
-
-    doc.save(`invoice_${customerName}_${invoiceDate}.pdf`);
-  };
+  const handlePrintThermal = useReactToPrint({
+    contentRef: printRef,
+  });
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-bold text-gray-900 font-serif">{t('createInvoiceTitle')}</h2>
           <p className="text-gray-500">{t('createInvoiceDesc')}</p>
         </div>
         <div className="flex gap-3">
-          <button 
-            onClick={handlePrint}
-            className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-200 rounded-lg text-gray-700 hover:bg-gray-50 transition-colors"
+          <button
+            onClick={handlePrintThermal}
+            className="bg-white border border-gray-200 text-gray-700 px-4 py-2 rounded-xl flex items-center gap-2 hover:bg-gray-50 transition-colors"
           >
-            <Printer size={18} />
-            <span>{t('printPdf')}</span>
+            <Printer size={20} />
+            <span>{t('printThermal')}</span>
           </button>
-          <button 
-            onClick={handleSave}
-            disabled={saving}
-            className="flex items-center gap-2 px-6 py-2 bg-rose-600 text-white rounded-lg hover:bg-rose-700 shadow-md shadow-rose-200 transition-all disabled:opacity-50"
+          <button
+            onClick={() => setShowPaymentModal(true)}
+            className="bg-rose-600 text-white px-6 py-2 rounded-xl flex items-center gap-2 hover:bg-rose-700 transition-colors shadow-lg shadow-rose-200 font-medium"
+            disabled={isSaving}
           >
-            <Save size={18} />
-            <span>{saving ? t('saving') : t('saveInvoice')}</span>
+            <Save size={20} />
+            <span>{isSaving ? t('saving') : t('saveInvoice')}</span>
           </button>
         </div>
       </div>
 
-      <div className="bg-white rounded-2xl shadow-sm border border-rose-100 p-6">
-        {/* Header Inputs */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">{t('customerName')}</label>
-            <input
-              type="text"
-              value={customerName}
-              onChange={(e) => setCustomerName(e.target.value)}
-              className="w-full px-4 py-2 rounded-lg border border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none transition-all"
-              placeholder={t('enterCustomerName')}
-            />
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Left Column: Form */}
+        <div className="lg:col-span-2 space-y-6">
+          {/* Customer & Date */}
+          <div className="bg-white p-6 rounded-2xl shadow-sm border border-rose-100 space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">{t('customerName')}</label>
+                <div className="relative">
+                  <User className="absolute left-3 rtl:right-3 rtl:left-auto top-1/2 -translate-y-1/2 text-gray-400" size={18} />
+                  <input
+                    type="text"
+                    list="customers-list"
+                    value={customerName}
+                    onChange={(e) => {
+                      setCustomerName(e.target.value);
+                      const cust = customers.find(c => c.name === e.target.value);
+                      setSelectedCustomer(cust || null);
+                    }}
+                    placeholder={t('enterCustomerName')}
+                    className="w-full pl-10 rtl:pr-10 rtl:pl-4 pr-4 py-2 rounded-xl border border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none"
+                  />
+                  <datalist id="customers-list">
+                    {customers.map(c => (
+                      <option key={c.id} value={c.name} />
+                    ))}
+                  </datalist>
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">{t('invoiceDate')}</label>
+                <input
+                  type="date"
+                  value={invoiceDate}
+                  onChange={(e) => setInvoiceDate(e.target.value)}
+                  className="w-full px-4 py-2 rounded-xl border border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none"
+                />
+              </div>
+            </div>
+
+            {/* Barcode Scanner Input */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">{t('scanBarcode')}</label>
+              <form onSubmit={handleBarcodeScan} className="relative">
+                <Barcode className="absolute left-3 rtl:right-3 rtl:left-auto top-1/2 -translate-y-1/2 text-gray-400" size={18} />
+                <input
+                  type="text"
+                  value={barcodeInput}
+                  onChange={(e) => setBarcodeInput(e.target.value)}
+                  placeholder="Scan barcode here..."
+                  className="w-full pl-10 rtl:pr-10 rtl:pl-4 pr-4 py-2 rounded-xl border border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none"
+                  autoFocus
+                />
+              </form>
+            </div>
           </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">{t('invoiceDate')}</label>
-            <input
-              type="date"
-              value={invoiceDate}
-              onChange={(e) => setInvoiceDate(e.target.value)}
-              className="w-full px-4 py-2 rounded-lg border border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none transition-all"
-            />
-          </div>
-          <div className="bg-rose-50 rounded-xl p-4 flex flex-col justify-center items-end rtl:items-start">
-            <span className="text-sm text-rose-600 font-medium">{t('totalOrderValue')}</span>
-            <span className="text-3xl font-bold text-rose-900">{totalAmount.toFixed(2)}</span>
+
+          {/* Items Table */}
+          <div className="bg-white rounded-2xl shadow-sm border border-rose-100 overflow-hidden">
+            <table className="w-full text-left rtl:text-right">
+              <thead className="bg-rose-50/50 text-gray-600 font-medium text-sm">
+                <tr>
+                  <th className="p-4 w-1/2">{t('itemName')}</th>
+                  <th className="p-4 w-20">{t('quantity')}</th>
+                  <th className="p-4 w-24">{t('unitPrice')}</th>
+                  <th className="p-4 w-24">{t('subtotal')}</th>
+                  <th className="p-4 w-10"></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-rose-50">
+                {items.map((item, index) => (
+                  <tr key={index} className="group hover:bg-rose-50/30">
+                    <td className="p-2">
+                      <input
+                        type="text"
+                        list="products-list"
+                        value={item.product_name}
+                        onChange={(e) => updateItem(index, 'product_name', e.target.value)}
+                        placeholder={t('selectItem')}
+                        className="w-full px-3 py-2 rounded-lg border border-transparent hover:border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none bg-transparent"
+                      />
+                      <datalist id="products-list">
+                        {products.map(p => (
+                          <option key={p.id} value={p.name} />
+                        ))}
+                      </datalist>
+                    </td>
+                    <td className="p-2">
+                      <input
+                        type="number"
+                        min="1"
+                        value={item.quantity}
+                        onChange={(e) => updateItem(index, 'quantity', parseInt(e.target.value) || 0)}
+                        className="w-full px-3 py-2 rounded-lg border border-transparent hover:border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none bg-transparent"
+                      />
+                    </td>
+                    <td className="p-2">
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={item.unit_price}
+                        onChange={(e) => updateItem(index, 'unit_price', parseFloat(e.target.value) || 0)}
+                        className="w-full px-3 py-2 rounded-lg border border-transparent hover:border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none bg-transparent"
+                      />
+                    </td>
+                    <td className="p-4 font-medium text-gray-900">
+                      ${item.subtotal.toFixed(2)}
+                    </td>
+                    <td className="p-2 text-center">
+                      <button
+                        onClick={() => removeItem(index)}
+                        className="text-gray-400 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"
+                      >
+                        <Trash2 size={18} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <button
+              onClick={addItem}
+              className="w-full py-3 flex items-center justify-center gap-2 text-rose-600 font-medium hover:bg-rose-50 transition-colors border-t border-rose-50"
+            >
+              <Plus size={18} />
+              <span>{t('addItem')}</span>
+            </button>
           </div>
         </div>
 
-        {/* Items Table */}
-        <div className="border rounded-xl overflow-hidden mb-6">
-          <table className="w-full">
-            <thead className="bg-gray-50 border-b border-gray-200">
-              <tr>
-                <th className="px-4 py-3 text-left rtl:text-right text-xs font-medium text-gray-500 uppercase tracking-wider w-[40%]">{t('itemName')}</th>
-                <th className="px-4 py-3 text-left rtl:text-right text-xs font-medium text-gray-500 uppercase tracking-wider w-[15%]">{t('quantity')}</th>
-                <th className="px-4 py-3 text-left rtl:text-right text-xs font-medium text-gray-500 uppercase tracking-wider w-[15%]">{t('unitPrice')}</th>
-                <th className="px-4 py-3 text-left rtl:text-right text-xs font-medium text-gray-500 uppercase tracking-wider w-[20%]">{t('subtotal')}</th>
-                <th className="px-4 py-3 w-[10%]"></th>
+        {/* Right Column: Summary */}
+        <div className="space-y-6">
+          <div className="bg-white p-6 rounded-2xl shadow-sm border border-rose-100 space-y-4">
+            <h3 className="font-bold text-gray-900">{t('totalOrderValue')}</h3>
+            
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between text-gray-600">
+                <span>{t('subtotal')}</span>
+                <span>${subtotal.toFixed(2)}</span>
+              </div>
+              <div className="flex justify-between items-center text-gray-600">
+                <span>{t('taxRate')}</span>
+                <input
+                  type="number"
+                  value={taxRate}
+                  onChange={(e) => setTaxRate(parseFloat(e.target.value) || 0)}
+                  className="w-16 px-2 py-1 rounded border border-gray-200 text-right outline-none focus:border-rose-500"
+                />
+              </div>
+              <div className="flex justify-between text-gray-600">
+                <span>Tax Amount</span>
+                <span>${taxAmount.toFixed(2)}</span>
+              </div>
+              <div className="pt-3 border-t border-dashed border-gray-200 flex justify-between items-end">
+                <span className="font-bold text-gray-900 text-lg">{t('total')}</span>
+                <span className="font-bold text-rose-600 text-2xl">${total.toFixed(2)}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Payment Modal */}
+      {showPaymentModal && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="p-6 border-b border-gray-100">
+              <h3 className="text-xl font-bold text-gray-900">{t('paymentMethod')}</h3>
+            </div>
+            <div className="p-6 space-y-6">
+              <div className="grid grid-cols-3 gap-3">
+                <button
+                  onClick={() => setPaymentMethod('cash')}
+                  className={`flex flex-col items-center justify-center p-4 rounded-xl border-2 transition-all ${
+                    paymentMethod === 'cash' ? 'border-rose-500 bg-rose-50 text-rose-700' : 'border-gray-100 hover:border-gray-200 text-gray-600'
+                  }`}
+                >
+                  <Banknote size={24} className="mb-2" />
+                  <span className="text-sm font-medium">{t('cash')}</span>
+                </button>
+                <button
+                  onClick={() => setPaymentMethod('visa')}
+                  className={`flex flex-col items-center justify-center p-4 rounded-xl border-2 transition-all ${
+                    paymentMethod === 'visa' ? 'border-rose-500 bg-rose-50 text-rose-700' : 'border-gray-100 hover:border-gray-200 text-gray-600'
+                  }`}
+                >
+                  <CreditCard size={24} className="mb-2" />
+                  <span className="text-sm font-medium">{t('visa')}</span>
+                </button>
+                <button
+                  onClick={() => setPaymentMethod('credit')}
+                  className={`flex flex-col items-center justify-center p-4 rounded-xl border-2 transition-all ${
+                    paymentMethod === 'credit' ? 'border-rose-500 bg-rose-50 text-rose-700' : 'border-gray-100 hover:border-gray-200 text-gray-600'
+                  }`}
+                >
+                  <User size={24} className="mb-2" />
+                  <span className="text-sm font-medium">{t('credit')}</span>
+                </button>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">{t('amountPaid')}</label>
+                <input
+                  type="number"
+                  value={amountPaid}
+                  onChange={(e) => setAmountPaid(parseFloat(e.target.value))}
+                  className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none text-xl font-bold"
+                />
+              </div>
+
+              <div className="flex justify-between items-center p-4 bg-gray-50 rounded-xl">
+                <span className="text-gray-600 font-medium">{t('changeDue')}</span>
+                <span className={`text-xl font-bold ${amountPaid - total >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                  ${(amountPaid - total).toFixed(2)}
+                </span>
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button
+                  onClick={() => setShowPaymentModal(false)}
+                  className="flex-1 px-4 py-3 text-gray-600 bg-gray-100 rounded-xl hover:bg-gray-200 font-medium"
+                >
+                  {t('cancel')}
+                </button>
+                <button
+                  onClick={handleSaveInvoice}
+                  className="flex-1 px-4 py-3 bg-rose-600 text-white rounded-xl hover:bg-rose-700 font-medium shadow-lg shadow-rose-200"
+                >
+                  {t('saveInvoice')}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hidden Thermal Print Template */}
+      <div className="hidden">
+        <div ref={printRef} className="p-4 w-[80mm] font-mono text-xs text-black">
+          <div className="text-center mb-4">
+            <h1 className="text-xl font-bold">Soft Rose</h1>
+            <p>Sales Manager</p>
+            <p>{new Date().toLocaleString()}</p>
+          </div>
+          <div className="border-b border-black mb-2"></div>
+          <div className="mb-2">
+            <p>Customer: {selectedCustomer ? selectedCustomer.name : customerName}</p>
+            <p>Invoice #: {Date.now().toString().slice(-6)}</p>
+          </div>
+          <table className="w-full mb-4">
+            <thead>
+              <tr className="border-b border-black">
+                <th className="text-left">Item</th>
+                <th className="text-right">Qty</th>
+                <th className="text-right">Price</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100">
-              {items.map((item, index) => (
-                <tr key={index} className="group hover:bg-rose-50/30 transition-colors">
-                  <td className="px-4 py-2">
-                    <input
-                      type="text"
-                      list="products-list"
-                      value={item.product_name}
-                      onChange={(e) => handleItemChange(index, 'product_name', e.target.value)}
-                      className="w-full bg-transparent border-none focus:ring-0 p-0 font-medium text-gray-900 placeholder-gray-400"
-                      placeholder={t('selectItem')}
-                    />
-                  </td>
-                  <td className="px-4 py-2">
-                    <input
-                      type="number"
-                      min="1"
-                      value={item.quantity}
-                      onChange={(e) => handleItemChange(index, 'quantity', Number(e.target.value))}
-                      className="w-full bg-transparent border-none focus:ring-0 p-0 text-gray-700"
-                    />
-                  </td>
-                  <td className="px-4 py-2">
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      value={item.unit_price}
-                      onChange={(e) => handleItemChange(index, 'unit_price', Number(e.target.value))}
-                      className="w-full bg-transparent border-none focus:ring-0 p-0 text-gray-700"
-                    />
-                  </td>
-                  <td className="px-4 py-2 text-gray-900 font-medium">
-                    {item.subtotal.toFixed(2)}
-                  </td>
-                  <td className="px-4 py-2 text-center">
-                    <button
-                      onClick={() => removeItem(index)}
-                      className="text-gray-400 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-all"
-                    >
-                      <Trash2 size={18} />
-                    </button>
-                  </td>
+            <tbody>
+              {items.map((item, i) => (
+                <tr key={i}>
+                  <td>{item.product_name}</td>
+                  <td className="text-right">{item.quantity}</td>
+                  <td className="text-right">{item.subtotal.toFixed(2)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
-          <datalist id="products-list">
-            {products.map(p => (
-              <option key={p.id} value={p.name} />
-            ))}
-          </datalist>
-        </div>
-
-        <button
-          onClick={addItem}
-          className="w-full py-3 border-2 border-dashed border-gray-200 rounded-xl text-gray-500 hover:border-rose-300 hover:text-rose-600 hover:bg-rose-50 transition-all flex items-center justify-center gap-2 font-medium"
-        >
-          <Plus size={20} />
-          {t('addItem')}
-        </button>
-
-        {/* Footer Summary */}
-        <div className="mt-8 flex justify-end rtl:justify-start">
-          <div className="w-72 space-y-3">
-            <div className="flex justify-between text-gray-600">
-              <span>{t('subtotal')}</span>
+          <div className="border-t border-black pt-2 space-y-1">
+            <div className="flex justify-between">
+              <span>Subtotal:</span>
               <span>{subtotal.toFixed(2)}</span>
             </div>
-            <div className="flex justify-between items-center text-gray-600">
-              <span className="flex items-center gap-2">
-                {t('taxRate')}
-                <input
-                  type="number"
-                  value={taxRate}
-                  onChange={(e) => setTaxRate(Number(e.target.value))}
-                  className="w-16 px-2 py-1 rounded border border-gray-200 text-sm focus:border-rose-500 focus:ring-1 focus:ring-rose-200 outline-none"
-                />
-              </span>
+            <div className="flex justify-between">
+              <span>Tax:</span>
               <span>{taxAmount.toFixed(2)}</span>
             </div>
-            <div className="pt-3 border-t border-gray-200 flex justify-between items-center">
-              <span className="text-lg font-bold text-gray-900">{t('total')}</span>
-              <span className="text-xl font-bold text-rose-600">{totalAmount.toFixed(2)}</span>
+            <div className="flex justify-between font-bold text-sm">
+              <span>Total:</span>
+              <span>{total.toFixed(2)}</span>
             </div>
+          </div>
+          <div className="mt-4 text-center">
+            <p>Thank you for your business!</p>
           </div>
         </div>
       </div>

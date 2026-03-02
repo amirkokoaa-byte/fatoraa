@@ -1,94 +1,74 @@
 import { useState, useEffect } from 'react';
-import { Plus, Search, Edit2, Trash2, Save, X } from 'lucide-react';
-import { Product } from '../lib/utils';
+import { Plus, Search, Upload, Edit, Trash2, AlertTriangle, Barcode } from 'lucide-react';
 import { toast } from 'sonner';
+import { Product } from '../lib/utils';
 import { useLanguage } from '../contexts/LanguageContext';
 
 export default function Inventory() {
-  const { t } = useLanguage();
+  const { t, dir } = useLanguage();
   const [products, setProducts] = useState<Product[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [searchTerm, setSearchTerm] = useState('');
-  
-  // Modal State
+  const [search, setSearch] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [editingProduct, setEditingProduct] = useState<Product | null>(null);
-  const [formData, setFormData] = useState({ name: '', price: '' });
+  const [currentProduct, setCurrentProduct] = useState<Partial<Product>>({});
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    loadProducts();
+    fetchProducts();
   }, []);
 
-  const loadProducts = () => {
-    setLoading(true);
-    fetch('/api/products')
-      .then(res => res.json())
-      .then(data => {
-        setProducts(data);
-        setLoading(false);
-      })
-      .catch(err => console.error(err));
-  };
-
-  const handleOpenModal = (product?: Product) => {
-    if (product) {
-      setEditingProduct(product);
-      setFormData({ name: product.name, price: product.price.toString() });
-    } else {
-      setEditingProduct(null);
-      setFormData({ name: '', price: '' });
+  const fetchProducts = async () => {
+    try {
+      const res = await fetch('/api/products');
+      const data = await res.json();
+      setProducts(data);
+    } catch (error) {
+      toast.error('Failed to load products');
+    } finally {
+      setLoading(false);
     }
-    setIsModalOpen(true);
   };
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    const payload = { 
-      name: formData.name, 
-      price: parseFloat(formData.price) 
-    };
-
     try {
-      if (editingProduct) {
-        await fetch(`/api/products/${editingProduct.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        toast.success(t('productUpdated'));
+      const method = currentProduct.id ? 'PUT' : 'POST';
+      const url = currentProduct.id ? `/api/products/${currentProduct.id}` : '/api/products';
+      
+      const res = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(currentProduct),
+      });
+
+      if (res.ok) {
+        toast.success(currentProduct.id ? t('productUpdated') : t('productAdded'));
+        setIsModalOpen(false);
+        fetchProducts();
       } else {
-        await fetch('/api/products', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        toast.success(t('productAdded'));
+        toast.error(t('failedSaveProduct'));
       }
-      setIsModalOpen(false);
-      loadProducts();
     } catch (error) {
-      console.error('Failed to save product', error);
       toast.error(t('failedSaveProduct'));
     }
   };
 
   const handleDelete = async (id: number) => {
     if (!confirm(t('confirmDeleteProduct'))) return;
+    
     try {
-      await fetch(`/api/products/${id}`, { method: 'DELETE' });
-      toast.success(t('productDeleted'));
-      loadProducts();
+      const res = await fetch(`/api/products/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        toast.success(t('productDeleted'));
+        fetchProducts();
+      } else {
+        toast.error(t('failedDeleteProduct'));
+      }
     } catch (error) {
-      console.error('Failed to delete', error);
       toast.error(t('failedDeleteProduct'));
     }
   };
 
-  const filteredProducts = products.filter(p => 
-    p.name.toLowerCase().includes(searchTerm.toLowerCase())
-  );
-
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleCsvImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -96,109 +76,132 @@ export default function Inventory() {
     reader.onload = async (event) => {
       const text = event.target?.result as string;
       const lines = text.split('\n');
-      
-      // Skip header if present (simple check: if first line contains 'name' or 'price')
-      const startIndex = lines[0].toLowerCase().includes('name') ? 1 : 0;
-      
       let successCount = 0;
       let failCount = 0;
 
-      for (let i = startIndex; i < lines.length; i++) {
+      for (let i = 1; i < lines.length; i++) {
         const line = lines[i].trim();
         if (!line) continue;
         
-        const [name, priceStr] = line.split(',');
-        if (name && priceStr) {
-          const price = parseFloat(priceStr);
-          if (!isNaN(price)) {
-            try {
-              await fetch('/api/products', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: name.trim(), price })
-              });
-              successCount++;
-            } catch (err) {
-              failCount++;
-            }
+        const [name, price, stock, min_stock, barcode] = line.split(',');
+        
+        if (name && price) {
+          try {
+            await fetch('/api/products', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                name, 
+                price: parseFloat(price),
+                stock: parseInt(stock) || 0,
+                min_stock: parseInt(min_stock) || 10,
+                barcode: barcode || ''
+              }),
+            });
+            successCount++;
+          } catch (err) {
+            failCount++;
           }
         }
       }
       
-      toast.success(t('importComplete', { success: successCount, fail: failCount }));
-      loadProducts();
-      // Reset input
-      e.target.value = '';
+      toast.success(t('importComplete').replace('{success}', successCount.toString()).replace('{fail}', failCount.toString()));
+      fetchProducts();
     };
     reader.readAsText(file);
   };
 
+  const filteredProducts = products.filter(p => 
+    p.name.toLowerCase().includes(search.toLowerCase()) ||
+    (p.barcode && p.barcode.includes(search))
+  );
+
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-bold text-gray-900 font-serif">{t('inventoryTitle')}</h2>
           <p className="text-gray-500">{t('inventoryDesc')}</p>
         </div>
         <div className="flex gap-3">
-          <label className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-200 rounded-lg text-gray-700 hover:bg-gray-50 cursor-pointer transition-colors">
-            <input type="file" accept=".csv" className="hidden" onChange={handleFileUpload} />
+          <label className="bg-white border border-gray-200 text-gray-700 px-4 py-2 rounded-xl flex items-center gap-2 hover:bg-gray-50 transition-colors cursor-pointer">
+            <Upload size={20} />
             <span>{t('importCsv')}</span>
+            <input type="file" accept=".csv" className="hidden" onChange={handleCsvImport} />
           </label>
-          <button 
-            onClick={() => handleOpenModal()}
-            className="flex items-center gap-2 px-4 py-2 bg-rose-600 text-white rounded-lg hover:bg-rose-700 shadow-md shadow-rose-200 transition-all"
+          <button
+            onClick={() => {
+              setCurrentProduct({ stock: 0, min_stock: 10 });
+              setIsModalOpen(true);
+            }}
+            className="bg-rose-600 text-white px-4 py-2 rounded-xl flex items-center gap-2 hover:bg-rose-700 transition-colors shadow-lg shadow-rose-200"
           >
-            <Plus size={18} />
+            <Plus size={20} />
             <span>{t('addProduct')}</span>
           </button>
         </div>
       </div>
 
-      <div className="bg-white rounded-2xl shadow-sm border border-rose-100 overflow-hidden">
-        <div className="p-4 border-b border-rose-100 bg-rose-50/30">
-          <div className="relative max-w-md">
-            <Search className="absolute left-3 rtl:right-3 rtl:left-auto top-1/2 -translate-y-1/2 text-gray-400" size={20} />
-            <input
-              type="text"
-              placeholder={t('searchProducts')}
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full pl-10 rtl:pr-10 rtl:pl-4 pr-4 py-2 rounded-xl border border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none"
-            />
-          </div>
-        </div>
+      {/* Search */}
+      <div className="relative">
+        <Search className="absolute left-3 rtl:right-3 rtl:left-auto top-1/2 -translate-y-1/2 text-gray-400" size={20} />
+        <input
+          type="text"
+          placeholder={t('searchProducts')}
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          className="w-full pl-10 rtl:pr-10 rtl:pl-4 pr-4 py-3 rounded-xl border border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none transition-all"
+        />
+      </div>
 
+      {/* Table */}
+      <div className="bg-white rounded-2xl shadow-sm border border-rose-100 overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead className="bg-gray-50 border-b border-gray-200">
+          <table className="w-full text-left rtl:text-right">
+            <thead className="bg-rose-50/50 text-gray-600 font-medium">
               <tr>
-                <th className="px-6 py-3 text-left rtl:text-right text-xs font-medium text-gray-500 uppercase tracking-wider">{t('productName')}</th>
-                <th className="px-6 py-3 text-left rtl:text-right text-xs font-medium text-gray-500 uppercase tracking-wider">{t('unitPrice')}</th>
-                <th className="px-6 py-3 text-right rtl:text-left text-xs font-medium text-gray-500 uppercase tracking-wider">{t('actions')}</th>
+                <th className="p-4">{t('productName')}</th>
+                <th className="p-4">{t('unitPrice')}</th>
+                <th className="p-4">{t('stock')}</th>
+                <th className="p-4">{t('barcode')}</th>
+                <th className="p-4 text-center">{t('actions')}</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100">
+            <tbody className="divide-y divide-rose-50">
               {loading ? (
-                <tr><td colSpan={3} className="px-6 py-8 text-center text-gray-500">{t('loadingInventory')}</td></tr>
+                <tr>
+                  <td colSpan={5} className="p-8 text-center text-gray-500">{t('loadingInventory')}</td>
+                </tr>
               ) : filteredProducts.length === 0 ? (
-                <tr><td colSpan={3} className="px-6 py-8 text-center text-gray-500">{t('noProducts')}</td></tr>
+                <tr>
+                  <td colSpan={5} className="p-8 text-center text-gray-500">{t('noProducts')}</td>
+                </tr>
               ) : (
                 filteredProducts.map((product) => (
                   <tr key={product.id} className="hover:bg-rose-50/30 transition-colors">
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{product.name}</td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600">{product.price.toFixed(2)}</td>
-                    <td className="px-6 py-4 whitespace-nowrap text-right rtl:text-left text-sm font-medium">
-                      <div className="flex justify-end rtl:justify-start gap-2">
-                        <button 
-                          onClick={() => handleOpenModal(product)}
-                          className="text-gray-400 hover:text-rose-600 transition-colors"
+                    <td className="p-4 font-medium text-gray-900">{product.name}</td>
+                    <td className="p-4 text-gray-600">${product.price.toFixed(2)}</td>
+                    <td className="p-4">
+                      <div className={`flex items-center gap-2 ${product.stock <= product.min_stock ? 'text-red-600 font-bold' : 'text-gray-600'}`}>
+                        {product.stock}
+                        {product.stock <= product.min_stock && <AlertTriangle size={16} />}
+                      </div>
+                    </td>
+                    <td className="p-4 text-gray-500 font-mono text-xs">{product.barcode || '-'}</td>
+                    <td className="p-4">
+                      <div className="flex items-center justify-center gap-2">
+                        <button
+                          onClick={() => {
+                            setCurrentProduct(product);
+                            setIsModalOpen(true);
+                          }}
+                          className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
                         >
-                          <Edit2 size={18} />
+                          <Edit size={18} />
                         </button>
-                        <button 
+                        <button
                           onClick={() => handleDelete(product.id)}
-                          className="text-gray-400 hover:text-red-600 transition-colors"
+                          className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
                         >
                           <Trash2 size={18} />
                         </button>
@@ -214,53 +217,85 @@ export default function Inventory() {
 
       {/* Modal */}
       {isModalOpen && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 backdrop-blur-sm">
-          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6 transform transition-all scale-100">
-            <div className="flex justify-between items-center mb-6">
-              <h3 className="text-xl font-bold text-gray-900 font-serif">
-                {editingProduct ? t('editProduct') : t('addNewProduct')}
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="p-6 border-b border-gray-100">
+              <h3 className="text-xl font-bold text-gray-900">
+                {currentProduct.id ? t('editProduct') : t('addNewProduct')}
               </h3>
-              <button onClick={() => setIsModalOpen(false)} className="text-gray-400 hover:text-gray-600">
-                <X size={24} />
-              </button>
             </div>
-            
-            <form onSubmit={handleSave} className="space-y-4">
+            <form onSubmit={handleSave} className="p-6 space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">{t('productName')}</label>
                 <input
                   type="text"
                   required
-                  value={formData.name}
-                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                  className="w-full px-4 py-2 rounded-lg border border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none"
-                  placeholder="e.g., Soft Rose Facial Tissues 550"
+                  value={currentProduct.name || ''}
+                  onChange={(e) => setCurrentProduct({ ...currentProduct, name: e.target.value })}
+                  className="w-full px-4 py-2 rounded-lg border border-gray-200 focus:ring-2 focus:ring-rose-500 outline-none"
                 />
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">{t('unitPrice')}</label>
-                <input
-                  type="number"
-                  required
-                  step="0.01"
-                  value={formData.price}
-                  onChange={(e) => setFormData({ ...formData, price: e.target.value })}
-                  className="w-full px-4 py-2 rounded-lg border border-gray-200 focus:border-rose-500 focus:ring-2 focus:ring-rose-200 outline-none"
-                  placeholder="0.00"
-                />
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">{t('unitPrice')}</label>
+                  <input
+                    type="number"
+                    required
+                    min="0"
+                    step="0.01"
+                    value={currentProduct.price || ''}
+                    onChange={(e) => setCurrentProduct({ ...currentProduct, price: parseFloat(e.target.value) })}
+                    className="w-full px-4 py-2 rounded-lg border border-gray-200 focus:ring-2 focus:ring-rose-500 outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">{t('stock')}</label>
+                  <input
+                    type="number"
+                    required
+                    min="0"
+                    value={currentProduct.stock || 0}
+                    onChange={(e) => setCurrentProduct({ ...currentProduct, stock: parseInt(e.target.value) })}
+                    className="w-full px-4 py-2 rounded-lg border border-gray-200 focus:ring-2 focus:ring-rose-500 outline-none"
+                  />
+                </div>
               </div>
-              
-              <div className="flex gap-3 mt-8">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">{t('minStock')}</label>
+                  <input
+                    type="number"
+                    required
+                    min="0"
+                    value={currentProduct.min_stock || 10}
+                    onChange={(e) => setCurrentProduct({ ...currentProduct, min_stock: parseInt(e.target.value) })}
+                    className="w-full px-4 py-2 rounded-lg border border-gray-200 focus:ring-2 focus:ring-rose-500 outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">{t('barcode')}</label>
+                  <div className="relative">
+                    <input
+                      type="text"
+                      value={currentProduct.barcode || ''}
+                      onChange={(e) => setCurrentProduct({ ...currentProduct, barcode: e.target.value })}
+                      className="w-full px-4 py-2 rounded-lg border border-gray-200 focus:ring-2 focus:ring-rose-500 outline-none pl-8"
+                    />
+                    <Barcode className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400" size={16} />
+                  </div>
+                </div>
+              </div>
+              <div className="flex gap-3 pt-4">
                 <button
                   type="button"
                   onClick={() => setIsModalOpen(false)}
-                  className="flex-1 px-4 py-2 border border-gray-200 rounded-lg text-gray-700 hover:bg-gray-50"
+                  className="flex-1 px-4 py-2 text-gray-600 bg-gray-100 rounded-xl hover:bg-gray-200 font-medium"
                 >
                   {t('cancel')}
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 px-4 py-2 bg-rose-600 text-white rounded-lg hover:bg-rose-700 shadow-md shadow-rose-200"
+                  className="flex-1 px-4 py-2 bg-rose-600 text-white rounded-xl hover:bg-rose-700 font-medium shadow-lg shadow-rose-200"
                 >
                   {t('saveProduct')}
                 </button>
